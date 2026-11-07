@@ -159,7 +159,7 @@ async function login() {
     const tgId = tg.initDataUnsafe?.user?.id;
     const same = cur.session && tgId && Number(cur.session.user?.user_metadata?.tg_id) === Number(tgId);
     if (!same) {
-      const r = await fetch(`${CONFIG.supabaseUrl}/functions/v1/tg-auth`, {
+      const r = await fetch(`${CONFIG.supabaseUrl}/functions/v1/${CONFIG.authFunction || 'tg-auth'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', apikey: CONFIG.supabaseKey },
         body: JSON.stringify({ initData: tg.initData }),
@@ -640,7 +640,7 @@ function toggleMic() {
 async function openInBrowser() {
   // Отдельная сессия для браузера: заново входим через Telegram
   try {
-    const r = await fetch(`${CONFIG.supabaseUrl}/functions/v1/tg-auth`, {
+    const r = await fetch(`${CONFIG.supabaseUrl}/functions/v1/${CONFIG.authFunction || 'tg-auth'}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: CONFIG.supabaseKey },
       body: JSON.stringify({ initData: tg.initData }),

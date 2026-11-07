@@ -4,6 +4,9 @@ export const CONFIG = {
   supabaseUrl: 'https://igihuuitstdvujucynbm.supabase.co',
   supabaseKey: 'sb_publishable_6OZi4TDPWP6vYOaUBMC9yQ_v-Qk3jM-',
 
+  // Имя функции входа в Supabase → Edge Functions
+  authFunction: 'clever-api',
+
   // Имя бота без @ и короткое имя мини-приложения из @BotFather (/newapp)
   botUsername: 'mafiamodern_bot',
   appName: 'play',
