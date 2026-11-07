@@ -57,6 +57,12 @@ const S = {
   shownRoleFor: null,
   tickBusy: false,
   createSettings: null,
+  isAdmin: false,
+  adminIds: [],
+  observer: false, // админ смотрит, не играя
+  adminView: {}, // id → {role, missed, actions}
+  adminRooms: [],
+  pauseVotes: [],
 };
 let roomChannel = null;
 let homeChannel = null;
@@ -118,6 +124,9 @@ function errText(e) {
     'not your action': 'У вашей роли нет такого хода',
     'same heal twice': 'Нельзя лечить одного и того же две ночи подряд',
     'not now': 'Сейчас писать в общий чат нельзя',
+    paused: 'Игра на паузе',
+    'too often': 'Вызывать администратора можно раз в 2 минуты',
+    'not a member': 'Вы не в этой комнате',
   };
   for (const [k, v] of Object.entries(map)) if (m.includes(k)) return v;
   return m || 'Ошибка';
@@ -183,6 +192,12 @@ async function login() {
   S.user = data.session?.user || null;
   if (!S.user) return false;
   S.profile = await rpc('mafia_my_profile');
+  try {
+    S.isAdmin = !!(await rpc('mafia_am_admin'));
+    S.adminIds = (await rpc('mafia_admin_ids')) || [];
+  } catch {
+    S.isAdmin = false;
+  }
   const t = await rpc('mafia_now');
   S.serverOffset = new Date(t).getTime() - Date.now();
   return true;
@@ -202,7 +217,9 @@ async function boot() {
   }
   const startCode = tg?.initDataUnsafe?.start_param || new URLSearchParams(location.search).get('room');
   if (startCode) {
-    await joinRoom(startCode);
+    // админ по ссылке из вызова — наблюдает, не садясь за стол
+    if (S.isAdmin) await observeRoom(startCode);
+    else await joinRoom(startCode);
     return;
   }
   // вернуться в игру после перезапуска
@@ -238,6 +255,12 @@ async function showHome() {
   homeChannel = sb
     .channel('mafia-home')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'mafia_rooms' }, () => refreshRooms())
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mafia_admin_calls' }, (p) => {
+      if (!S.isAdmin) return;
+      haptic('warning');
+      toast(`🚨 Вызов от ${p.new?.name || 'игрока'}${p.new?.reason ? `: ${p.new.reason}` : ''}`, 5000);
+      refreshRooms();
+    })
     .subscribe();
   clearInterval(pingTimer);
   pingTimer = setInterval(() => S.screen === 'home' && refreshRooms(), 15000);
@@ -248,6 +271,13 @@ async function refreshRooms() {
     S.rooms = (await rpc('mafia_public_rooms')) || [];
   } catch {
     S.rooms = [];
+  }
+  if (S.isAdmin) {
+    try {
+      S.adminRooms = (await rpc('mafia_admin_rooms')) || [];
+    } catch {
+      S.adminRooms = [];
+    }
   }
   if (S.screen === 'home') renderHome();
 }
@@ -271,11 +301,45 @@ function renderHome() {
       <button class="btn primary" data-act="create">＋ Создать комнату</button>
       <button class="btn" data-act="enter-code">🔑 По коду</button>
     </div>
+    ${S.isAdmin ? adminSection() : ''}
     <div class="section-title"><h3>Открытые комнаты</h3><button class="btn small ghost" data-act="refresh">Обновить</button></div>
     <div class="rooms">${rooms || '<div class="empty">Пока никто не ждёт игроков.<br>Создайте свою комнату и позовите друзей!</div>'}</div>
     <div class="section-title"><h3>Как играть</h3></div>
     <button class="btn block ghost" data-act="rules">📖 Правила и роли</button>
   </div>`;
+}
+
+function adminSection() {
+  const list = S.adminRooms
+    .map((r) => {
+      const state = r.status === 'playing' ? `${r.paused ? '⏸ пауза' : phaseName(r.phase)} · живых ${r.alive}/${r.players}` : `лобби · ${r.players} игр.`;
+      return `<button class="room-item" data-act="observe" data-code="${esc(r.code)}" style="${r.calls ? 'border-color:var(--red)' : ''}">
+        <div style="font-size:26px">${r.calls ? '🚨' : r.status === 'playing' ? '🎭' : '🎲'}</div>
+        <div><div class="t">${esc(r.title)} <span style="color:var(--gold);font-size:12px">${esc(r.code)}</span></div>
+        <div class="s">${state}${r.calls ? ` · <b style="color:var(--red2)">вызовов: ${r.calls}</b>` : ''}</div></div>
+        <div class="n">👁</div></button>`;
+    })
+    .join('');
+  return `<div class="section-title"><h3>👮 Админ-панель</h3><button class="btn small ghost" data-act="enter-code-admin">Код</button></div>
+    <div class="rooms">${list || '<div class="empty">Сейчас никто не играет</div>'}</div>`;
+}
+
+function phaseName(ph) {
+  return { night: '🌙 ночь', day: '☀️ день', vote: '🗳 голосование', last_word: '🎤 последнее слово', lobby: 'лобби' }[ph] || ph;
+}
+
+/** Админ заходит посмотреть комнату (без участия в игре). */
+async function observeRoom(code) {
+  try {
+    const rid = await rpc('mafia_room_id', { p_code: code });
+    if (!rid) throw new Error('room not found');
+    closeModal();
+    await openRoom(rid, true);
+    rpc('mafia_admin_handle', { p_room: rid }).catch(() => {});
+  } catch (e) {
+    toast(errText(e));
+    showHome();
+  }
 }
 
 function rolesLine(s) {
@@ -293,6 +357,7 @@ function showRules() {
     <p>🌙 <b>Ночь.</b> Все микрофоны выключены. Мафия тайно выбирает жертву, Комиссар проверяет игрока, Доктор лечит, остальные спят.</p>
     <p>☀️ <b>День.</b> Ведущий объявляет, кто погиб. Живые обсуждают голосом, кто мафия.</p>
     <p>🗳 <b>Голосование.</b> Каждый живой голосует против одного игрока. Больше всего голосов — игрок выбывает (при равенстве никто). У выбывшего — последнее слово.</p>
+    <p>💤 <b>АФК.</b> Кто два хода подряд ничего не делает (не голосует днём, не ходит ночью своей ролью) — выбывает. Кто пропал из сети больше чем на 3 минуты — тоже.</p>
     <p>🏆 <b>Победа.</b> Мирные — когда вся мафия выбыла. Мафия — когда её не меньше, чем остальных.</p>
     <h3 style="margin-top:14px">Роли</h3>
     ${Object.values(ROLES).map((r) => `<p>${r.emoji} <b>${r.name}</b> — ${r.text}</p>`).join('')}
@@ -346,11 +411,11 @@ async function createRoom() {
   }
 }
 
-function askCode() {
+function askCode(observe = false) {
   openModal(`<div class="sheet">
     <h2>Войти по коду</h2>
     <input class="input" id="code-input" maxlength="5" placeholder="Например: K7Q2M" style="text-transform:uppercase;font-size:22px;letter-spacing:4px;text-align:center">
-    <div class="row" style="margin-top:12px"><button class="btn" data-act="close-modal">Отмена</button><button class="btn primary" data-act="code-go">Войти</button></div>
+    <div class="row" style="margin-top:12px"><button class="btn" data-act="close-modal">Отмена</button><button class="btn primary" data-act="code-go" ${observe ? 'data-observe="1"' : ''}>${observe ? '👁 Наблюдать' : 'Войти'}</button></div>
   </div>`);
   setTimeout(() => document.getElementById('code-input')?.focus(), 50);
 }
@@ -380,9 +445,11 @@ function leaveRoomChannels() {
   S.voice = null;
 }
 
-async function openRoom(rid) {
+async function openRoom(rid, observe = false) {
   leaveRoomChannels();
   S.screen = 'room';
+  S.observer = observe;
+  S.micOn = !observe; // админ заходит молча
   S.events = [];
   S.chat = [];
   S.role = null;
@@ -400,15 +467,17 @@ async function openRoom(rid) {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'mafia_votes', filter: `room_id=eq.${rid}` }, () => loadVotes().then(renderRoom))
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mafia_events', filter: `room_id=eq.${rid}` }, (p) => onEvent(p.new))
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mafia_chat', filter: `room_id=eq.${rid}` }, (p) => onChat(p.new))
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'mafia_pause_votes', filter: `room_id=eq.${rid}` }, () => loadPauseVotes().then(renderRoom))
     .subscribe((status) => {
       // после переподключения — догружаем всё
       if (status === 'SUBSCRIBED') refreshAll();
     });
   pingTimer = setInterval(() => {
-    rpc('mafia_ping', { p_room: rid }).catch(() => {});
+    if (!S.observer) rpc('mafia_ping', { p_room: rid }).catch(() => {});
     loadPlayers().then(renderRoom);
+    if (S.isAdmin && S.room?.status === 'playing') loadAdminView().then(renderRoom);
   }, 20000);
-  rpc('mafia_ping', { p_room: rid }).catch(() => {});
+  if (!S.observer) rpc('mafia_ping', { p_room: rid }).catch(() => {});
   clockTimer = setInterval(clock, 500);
   teamTimer = setInterval(() => {
     if (S.room?.phase === 'night' && isMafia()) loadTeamVotes().then(renderRoom);
@@ -419,8 +488,25 @@ async function openRoom(rid) {
 async function refreshAll() {
   if (!S.room) return;
   await loadRoom(S.room.id);
-  await Promise.all([loadPlayers(), loadEvents(), loadChat(), loadVotes(), loadSecret()]);
+  await Promise.all([loadPlayers(), loadEvents(), loadChat(), loadVotes(), loadSecret(), loadPauseVotes()]);
   renderRoom();
+}
+
+async function loadPauseVotes() {
+  if (!S.room) return;
+  const { data } = await sb.from('mafia_pause_votes').select('user_id, created_at').eq('room_id', S.room.id);
+  // голоса старше 90 секунд сервер уже не считает
+  S.pauseVotes = (data || []).filter((v) => new Date(v.created_at).getTime() > now() - 90000);
+}
+
+async function loadAdminView() {
+  if (!S.isAdmin || !S.room) return;
+  try {
+    const rows = (await rpc('mafia_admin_view', { p_room: S.room.id })) || [];
+    S.adminView = Object.fromEntries(rows.map((r) => [r.user_id, r]));
+  } catch {
+    S.adminView = {};
+  }
 }
 
 async function loadRoom(rid) {
@@ -438,7 +524,9 @@ async function loadPlayers() {
   if (!S.room) return;
   const { data } = await sb.from('mafia_players').select('*').eq('room_id', S.room.id).order('seat');
   S.players = data || [];
-  if (S.room && S.room.status !== 'playing' && !S.players.some((p) => p.user_id === S.user.id)) {
+  // админ, севший за стол, — уже игрок
+  if (S.observer && S.players.some((p) => p.user_id === S.user.id)) S.observer = false;
+  if (S.room && !S.observer && S.room.status !== 'playing' && !S.players.some((p) => p.user_id === S.user.id)) {
     toast('Вы больше не в комнате');
     showHome();
   }
@@ -461,6 +549,7 @@ async function loadVotes() {
 }
 
 async function loadSecret() {
+  if (S.isAdmin) await loadAdminView();
   if (!S.room || S.room.status === 'lobby') {
     S.role = null;
     S.team = [];
@@ -557,6 +646,13 @@ function clock() {
   const r = S.room;
   if (!r) return;
   const el = document.getElementById('timer');
+  if (r.paused && r.status === 'playing') {
+    if (el) {
+      el.textContent = '⏸';
+      el.classList.remove('low');
+    }
+    return;
+  }
   if (!r.phase_ends || r.status !== 'playing') {
     if (el) el.textContent = '';
     return;
@@ -603,8 +699,10 @@ async function startVoice() {
 function speakRule() {
   const r = S.room;
   const m = me();
+  if (S.observer) return { can: true, to: () => true, note: '👮 Вас слышат все' };
   if (!r || !m) return { can: false };
   if (r.status !== 'playing') return { can: true, to: () => true };
+  if (r.paused) return { can: true, to: () => true, note: '⏸ Пауза — можно говорить всем' };
   if (r.phase === 'night') {
     if (m.alive && isMafia()) {
       const team = new Set(S.team.map((t) => t.user_id));
@@ -623,7 +721,9 @@ function updateVoiceRules() {
   const v = S.voice;
   if (!v) return;
   const rule = speakRule();
-  v.setRules((id) => rule.can && rule.to(id));
+  const admins = new Set(S.adminIds);
+  // администратор слышит всех всегда — он следит за порядком
+  v.setRules((id) => admins.has(id) || (rule.can && rule.to(id)));
 }
 
 function toggleMic() {
@@ -729,12 +829,87 @@ function invite() {
 }
 
 async function leave() {
+  if (S.observer) {
+    showHome();
+    return;
+  }
   const playing = S.room?.status === 'playing' && alive();
   if (playing && !(await ask('Выйти из игры? Вы выбываете до конца партии.'))) return;
   try {
     await rpc('mafia_leave', { p_room: S.room.id });
   } catch {}
   showHome();
+}
+
+async function callAdmin() {
+  const reasons = ['Оскорбления', 'Мешают играть', 'Подозрение на нечестную игру', 'Технические проблемы', 'Другое'];
+  openModal(`<div class="sheet"><h2>🚨 Вызвать администратора</h2>
+    <p style="color:var(--muted)">Администратор получит сообщение в Telegram и сможет зайти в комнату.</p>
+    <div style="display:grid;gap:8px;margin-top:10px">${reasons
+      .map((r) => `<button class="btn" data-act="call-go" data-reason="${esc(r)}">${esc(r)}</button>`)
+      .join('')}</div>
+    <button class="btn ghost block" data-act="close-modal" style="margin-top:10px">Отмена</button></div>`);
+}
+
+async function callAdminGo(reason) {
+  closeModal();
+  try {
+    const id = await rpc('mafia_call_admin', { p_room: S.room.id, p_reason: reason });
+    const { data } = await sb.auth.getSession();
+    fetch(`${CONFIG.supabaseUrl}/functions/v1/${CONFIG.authFunction || 'tg-auth'}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: CONFIG.supabaseKey,
+        Authorization: `Bearer ${data.session?.access_token || ''}`,
+      },
+      body: JSON.stringify({ action: 'notify', call_id: id, link: inviteLink(S.room.code) }),
+    })
+      .then((r) => r.json())
+      .then((j) => toast(j.sent ? '🚨 Администратор вызван' : '🚨 Вызов записан — администратор увидит его в игре', 4000))
+      .catch(() => toast('🚨 Вызов записан'));
+  } catch (e) {
+    toast(errText(e));
+  }
+}
+
+const canManage = () => S.isAdmin || isHost();
+
+async function managePause(on) {
+  try {
+    await rpc('mafia_pause', { p_room: S.room.id, p_on: on });
+  } catch (e) {
+    toast(errText(e));
+  }
+}
+
+async function stopGame() {
+  if (!(await ask('Остановить игру? Партия закончится без победителя.'))) return;
+  try {
+    await rpc('mafia_stop', { p_room: S.room.id });
+  } catch (e) {
+    toast(errText(e));
+  }
+}
+
+async function votePause() {
+  try {
+    const r = await rpc('mafia_vote_pause', { p_room: S.room.id });
+    haptic('light');
+    if (r && r.votes < r.need) toast(`Голос учтён: ${r.votes} из ${r.need}`);
+  } catch (e) {
+    toast(errText(e));
+  }
+}
+
+async function adminKick(userId) {
+  const name = nameOf(userId);
+  if (!(await ask(`Удалить ${name} из ${S.room.status === 'playing' ? 'игры' : 'комнаты'}?`))) return;
+  try {
+    await rpc('mafia_admin_kick', { p_room: S.room.id, p_user: userId, p_reason: 'нарушение правил' });
+  } catch (e) {
+    toast(errText(e));
+  }
 }
 
 function ask(text) {
@@ -762,6 +937,9 @@ function showRole() {
 function phaseInfo() {
   const r = S.room;
   const n = r.day;
+  if (r.paused && r.status === 'playing') {
+    return { cls: 'phase-lobby', ico: '⏸', title: 'Пауза', text: `${r.paused_by ? `Поставил(а): ${r.paused_by}. ` : ''}Таймер стоит, говорить можно всем.` };
+  }
   switch (r.phase) {
     case 'lobby':
       return { cls: 'phase-lobby', ico: '🎲', title: 'Ожидание игроков', text: `${S.players.length} из ${r.settings?.max || 12}. Нужно минимум 4.` };
@@ -832,21 +1010,24 @@ function renderPanel() {
       ${isHost() ? '' : '<p style="margin-top:8px">Игру начнёт создатель комнаты 👑</p>'}
     </div>`;
   } else if (r.status === 'finished') {
-    const w = { town: ['🎉', 'Победили мирные жители'], mafia: ['🕶', 'Победила мафия'], maniac: ['🔪', 'Победил маньяк'] }[r.winner] || ['🏁', 'Игра окончена'];
+    const w = { town: ['🎉', 'Победили мирные жители'], mafia: ['🕶', 'Победила мафия'], maniac: ['🔪', 'Победил маньяк'], stopped: ['⏹', 'Игра остановлена'] }[r.winner] || ['🏁', 'Игра окончена'];
     const myTeam = ROLES[me()?.role_public || S.role]?.team;
     const iWon = myTeam && myTeam === r.winner;
     html = `<div class="panel"><div class="winner"><div class="big">${w[0]}</div><h2>${w[1]}</h2>
-      <p>${iWon ? 'Вы победили! 🏆' : 'В этот раз не повезло'}</p></div>
+      <p>${r.winner === 'stopped' ? 'Партия прервана, без победителя' : S.observer ? '' : iWon ? 'Вы победили! 🏆' : 'В этот раз не повезло'}</p></div>
       <div class="roles-table">${S.players
         .map((p) => `<div><span>${esc(p.name)}${p.alive ? '' : ' 💀'}</span><span>${ROLES[p.role_public]?.emoji || ''} ${esc(ROLES[p.role_public]?.name || '')}</span></div>`)
         .join('')}</div>
       <div class="row" style="margin-top:12px">
-        ${isHost() ? '<button class="btn primary" data-act="reset">🔄 Ещё партию</button>' : '<p>Создатель комнаты может начать новую партию</p>'}
+        ${canManage() ? '<button class="btn primary" data-act="reset">🔄 Ещё партию</button>' : '<p>Создатель комнаты может начать новую партию</p>'}
       </div></div>`;
   } else {
     const acts = availableActions();
     const act = currentAction();
-    if (!alive()) {
+    if (S.observer) {
+      html = `<div class="panel"><h3>👮 Вы наблюдаете как администратор</h3>
+        <p>Видны все роли и ночные ходы. Вас слышат все, когда включён микрофон.</p></div>`;
+    } else if (!alive()) {
       html = `<div class="panel"><h3>💀 Вы выбыли</h3><p>Наблюдайте за игрой. Писать можно в чат выбывших.</p></div>`;
     } else if (r.phase === 'night' && !acts.length) {
       html = `<div class="panel"><h3>😴 Вы спите</h3><p>Ждите утра. Микрофон выключен.</p></div>`;
@@ -870,6 +1051,21 @@ function renderPanel() {
         ${isHost() ? '<button class="btn small" data-act="skip" style="margin-top:6px">⏭ Дальше</button>' : ''}</div>`;
     }
   }
+  // пульт: пауза / стоп (создатель комнаты или админ)
+  if (r.status === 'playing' && canManage()) {
+    html = `<div class="row" style="margin-bottom:12px">
+      ${r.paused ? '<button class="btn gold" data-act="resume">▶ Продолжить</button>' : '<button class="btn" data-act="pause">⏸ Пауза</button>'}
+      <button class="btn ghost" data-act="stop">⏹ Остановить</button>
+    </div>` + html;
+  } else if (r.status === 'lobby' && S.observer) {
+    html = `<div class="row" style="margin-bottom:12px"><button class="btn primary" data-act="sit">🪑 Сесть за стол (играть)</button></div>` + html;
+  }
+  // предупреждение АФК
+  const m = me();
+  if (r.status === 'playing' && m?.alive && (m.missed || 0) >= 1) {
+    html = `<div class="panel" style="border-color:var(--gold)"><b>⚠️ Вы пропустили прошлый ход.</b>
+      <p>Ещё один пропуск подряд — и вы выбываете за неактивность.</p></div>` + html;
+  }
   el.innerHTML = html;
 }
 
@@ -891,7 +1087,9 @@ function renderPlayers() {
       if (team.has(p.user_id) && isMafia()) cls.push('team');
       if (S.voice?.speaking(p.user_id)) cls.push('speaking');
       let sub = '';
-      if (p.role_public) sub = `${ROLES[p.role_public]?.emoji || ''} ${ROLES[p.role_public]?.name || ''}`;
+      const av = S.observer ? S.adminView[p.user_id] : null;
+      if (av?.role && !p.role_public) sub = `${ROLES[av.role]?.emoji || ''} ${ROLES[av.role]?.name || ''}${av.missed ? ` · 💤${av.missed}` : ''}`;
+      else if (p.role_public) sub = `${ROLES[p.role_public]?.emoji || ''} ${ROLES[p.role_public]?.name || ''}`;
       else if (team.has(p.user_id) && isMafia() && p.user_id !== S.user.id) sub = '🕶 союзник';
       else if (p.user_id === S.user.id) sub = 'это вы';
       else if (r.status !== 'playing' && Date.now() - new Date(p.last_seen).getTime() > 60000) sub = 'не в сети';
@@ -900,7 +1098,8 @@ function renderPlayers() {
         <span class="seat">${p.seat}</span>${badge ? `<span class="badge">${badge}</span>` : ''}
         ${votes[p.user_id] ? `<span class="votes">${votes[p.user_id]}</span>` : ''}
         ${avatar(p)}<div class="name">${esc(p.name)}</div><div class="sub">${esc(sub)}</div>
-        ${isHost() && r.status === 'lobby' && p.user_id !== S.user.id ? `<button class="btn small ghost" data-act="kick" data-id="${p.user_id}" style="margin-top:4px;padding:2px 8px">убрать</button>` : ''}
+        ${S.observer && av?.actions && r.phase === 'night' ? `<div class="sub" style="color:var(--red2)">${Object.entries(av.actions).map(([k, t]) => `${ACTIONS[k]?.icon || ''}→${esc(nameOf(t))}`).join(' ')}</div>` : ''}
+        ${S.isAdmin && p.user_id !== S.user.id && (p.alive || r.status !== 'playing') ? `<button class="btn small ghost" data-act="admin-kick" data-id="${p.user_id}" style="margin-top:4px;padding:2px 8px">👮 удалить</button>` : isHost() && r.status === 'lobby' && p.user_id !== S.user.id ? `<button class="btn small ghost" data-act="kick" data-id="${p.user_id}" style="margin-top:4px;padding:2px 8px">убрать</button>` : ''}
       </div>`;
     })
     .join('');
@@ -909,6 +1108,7 @@ function renderPlayers() {
 function chatChannels() {
   const r = S.room;
   const list = [['all', 'Общий']];
+  if (S.observer && r?.status === 'playing') return [...list, ['mafia', '🕶 Мафия'], ['dead', '💀 Выбывшие']];
   if (r?.status === 'playing' && isMafia() && alive()) list.push(['mafia', '🕶 Мафия']);
   if (r?.status === 'playing' && !alive()) list.push(['dead', '💀 Выбывшие']);
   if (r?.status === 'finished') list.push(['mafia', '🕶 Мафия'], ['dead', '💀 Выбывшие']);
@@ -935,9 +1135,9 @@ function renderFeed() {
   const input = document.getElementById('chat-text');
   if (input) {
     const r = S.room;
-    const blocked = S.chatTab === 'all' && r.status === 'playing' && (!alive() || r.phase === 'night');
+    const blocked = !S.observer && (S.chatTab === 'all' && r.status === 'playing' && (!alive() || r.phase === 'night'));
     input.disabled = blocked;
-    input.placeholder = blocked ? (alive() ? 'Ночью общий чат молчит' : 'Пишите в чат выбывших') : 'Сообщение…';
+    input.placeholder = S.observer ? 'Сообщение от администратора…' : blocked ? (alive() ? 'Ночью общий чат молчит' : 'Пишите в чат выбывших') : 'Сообщение…';
   }
 }
 
@@ -963,13 +1163,20 @@ function renderDock() {
     }
   }
   const peers = v?.active ? [...v.peers.keys()].filter((id) => v.connected(id)).length : 0;
+  const adminTalking = v?.active && !S.isAdmin && S.adminIds.some((id) => v.speaking(id));
+  if (adminTalking) label = '👮 Говорит администратор';
+  const r = S.room;
+  const canVotePause = r.status === 'playing' && !canManage() && alive();
+  const pv = S.pauseVotes.length;
   el.innerHTML = `
     <button class="${micCls}" data-act="mic">${micIco}</button>
     <div style="flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center">
       <b style="font-size:14px">${esc(label)}</b>
       <small style="color:var(--muted)">${v?.active ? `На связи: ${peers} · <a href="#" data-act="unlock" style="color:var(--muted)">нет звука?</a>` : 'Нажмите 🎙 — и говорите голосом'}</small>
     </div>
-    ${S.room.status === 'playing' ? '<button class="btn small" data-act="role">🃏 Роль</button>' : ''}
+    ${S.room.status === 'playing' && !S.observer ? '<button class="btn small" data-act="role">🃏</button>' : ''}
+    ${canVotePause ? `<button class="btn small" data-act="vote-pause" title="Голосовать за ${r.paused ? 'продолжение' : 'паузу'}">${r.paused ? '▶' : '⏸'}${pv ? ` ${pv}` : ''}</button>` : ''}
+    ${!S.isAdmin && !S.observer ? '<button class="btn small" data-act="call-admin" title="Вызвать администратора">🚨</button>' : ''}
     ${inTelegram ? '<button class="btn small ghost" data-act="browser" title="Открыть в браузере">🌐</button>' : ''}`;
 }
 
@@ -1019,7 +1226,7 @@ document.addEventListener('click', async (e) => {
       break;
     case 'code-go': {
       const code = document.getElementById('code-input')?.value.trim();
-      if (code) joinRoom(code);
+      if (code) t.dataset.observe ? observeRoom(code) : joinRoom(code);
       break;
     }
     case 'join':
@@ -1089,6 +1296,37 @@ document.addEventListener('click', async (e) => {
       break;
     case 'leave':
       leave();
+      break;
+    case 'observe':
+      observeRoom(t.dataset.code);
+      break;
+    case 'enter-code-admin':
+      askCode(true);
+      break;
+    case 'sit':
+      joinRoom(S.room.code);
+      break;
+    case 'pause':
+      managePause(true);
+      break;
+    case 'resume':
+      managePause(false);
+      break;
+    case 'stop':
+      stopGame();
+      break;
+    case 'vote-pause':
+      votePause();
+      break;
+    case 'call-admin':
+      callAdmin();
+      break;
+    case 'call-go':
+      callAdminGo(t.dataset.reason);
+      break;
+    case 'admin-kick':
+      e.stopPropagation();
+      adminKick(t.dataset.id);
       break;
   }
 });
